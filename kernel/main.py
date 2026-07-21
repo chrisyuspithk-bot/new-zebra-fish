@@ -381,15 +381,15 @@ def _tta_flip_legacy(tensor, flip_z=False, flip_y=False, flip_x=False, transpose
         t = t.permute(0, 1, 2, 4, 3)
 
     def inverse(hmap):
-        h = hmap.copy()
+        h = hmap.copy()  # hmap is 3D [D, H, W] (batch/channel removed)
         if transpose_xy:
-            h = h.transpose(0, 1, 3, 2)
+            h = h.transpose(0, 2, 1)
         if flip_x:
-            h = h[:, :, :, ::-1]
+            h = h[:, :, ::-1]
         if flip_y:
-            h = h[:, :, ::-1, :]
+            h = h[:, ::-1, :]
         if flip_z:
-            h = h[:, ::-1, :, :]
+            h = h[::-1, :, :]
         return h
     return t, inverse
 
