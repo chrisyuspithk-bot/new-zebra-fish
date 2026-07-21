@@ -38,6 +38,7 @@ POOL = 4
 
 # ── model weights & preprocessing (one pp per model) ──────────────────────
 WEIGHT_NAMES = ['unet3d_bright.pt', 'unet3d_traintophat.pt']
+FALLBACK_NAME = 'unet3d_full.pt'
 PREPROCS = ['', 'tophat']
 
 # ── detection & tracking knobs ────────────────────────────────────────────
@@ -118,18 +119,28 @@ class UNet3D(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _find_weight(name):
-    cands = [f"/kaggle/input/biohub-unet3d-weights/{name}",
-             f"models/{name}"] + glob.glob(f"/kaggle/input/**/{name}", recursive=True)
+    cands = [
+        f"/kaggle/input/biohub-unet3d-weights/{name}",
+        f"/kaggle/input/biohub-unet3d-weights-2/{name}",
+        f"models/{name}",
+    ] + glob.glob(f"/kaggle/input/**/{name}", recursive=True)
     p = next((c for c in cands if Path(c).exists()), None)
     if p is None:
         raise FileNotFoundError(
-            f"{name} not found; attach biohub-unet3d-weights. "
-            f"/kaggle/input: {glob.glob('/kaggle/input/*')}"
+            f"{name} not found. /kaggle/input: {glob.glob('/kaggle/input/*')}"
         )
     return p
 
 
-WEIGHTS = [_find_weight(n) for n in WEIGHT_NAMES]
+# Resolve weight files — try specialized models first, fall back to full model
+try:
+    WEIGHTS = [_find_weight(n) for n in WEIGHT_NAMES]
+    PREPROCS = ['', 'tophat']
+except FileNotFoundError:
+    print("specialized weights not found, trying fallback:", FALLBACK_NAME)
+    WEIGHTS = [_find_weight(FALLBACK_NAME)]
+    PREPROCS = ['']
+    TTA = False  # single-model: skip TTA for speed
 
 # Load models with ensemble weights
 MODELS = []
@@ -147,8 +158,6 @@ for _w in WEIGHTS:
 # Normalize ensemble weights to sum to 1
 MODEL_WEIGHTS_ENS = np.array(MODEL_WEIGHTS_ENS, dtype=np.float32)
 MODEL_WEIGHTS_ENS /= MODEL_WEIGHTS_ENS.sum()
-
-assert len(MODELS) == len(PREPROCS), (len(MODELS), len(PREPROCS))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

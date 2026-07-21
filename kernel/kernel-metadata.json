@@ -8,5 +8,5 @@
   "enable_gpu": true,
   "enable_internet": false,
   "competition_sources": ["biohub-cell-tracking-during-development"],
-  "dataset_sources": ["xiaoleilian/biohub-unet3d-weights"]
+  "dataset_sources": ["chrisyu2021/biohub-unet3d-weights"]
 }
