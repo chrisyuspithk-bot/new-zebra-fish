@@ -1,15 +1,23 @@
-# Biohub Cell Tracking — Improved 3D U-Net + Advanced Tracking
-# Based on: https://www.kaggle.com/code/xiaoleilian/biohub-ct-mix-divaug
-# Improvements:
-#   1. TTA (flip+rotate) during inference per model
-#   2. Ensemble weighting by validation recall
-#   3. Multi-scale peak detection with adaptive thresholding
-#   4. Hungarian linking with combined distance+appearance cost
-#   5. Cubic spline gap closing instead of linear
-#   6. Kalman-filter-inspired motion prediction for linking
-#   7. Confidence-weighted linefit smoothing
+# Biohub Cell Tracking — Multi-Model Ensemble + ILP Tracking
+# Learnings merged from:
+#   - HarshitSama's 0.950 baseline (UNet-Transformer + ILP + division aug)
+#     https://www.kaggle.com/code/harshitsama/biohub-0-950-baseline-explained-reproducible
+#   - xiaoleilian's 0.969 solution (UNet3D ensemble + Kalman + cubic spline)
+#     https://www.kaggle.com/code/xiaoleilian/biohub-ct-mix-divaug
+#
+# Key improvements over the 0.950 baseline:
+#   1. Multi-architecture ensemble (UNet3D + TemporalUNet-Transformer)
+#   2. ILP solver for optimal primary tracking (from support pack)
+#   3. Kalman-inspired motion prediction for secondary linking
+#   4. Adaptive detection threshold based on heatmap statistics
+#   5. Cubic Hermite spline gap closing (smoother than linear)
+#   6. Confidence-weighted linefit smoothing
+#   7. Two-pass repair tracking with candidate detections
+#   8. Enhanced 8-fliprot TTA for all models
+#   9. Recall-weighted ensemble averaging
+#  10. Division-term metric augmentation for division_jaccard
 
-import os, json, glob, time, gc
+import os, json, glob, time, gc, sys, csv, importlib
 from collections import defaultdict
 from pathlib import Path
 
@@ -17,6 +25,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy.ndimage import grey_opening
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
@@ -33,12 +42,49 @@ if torch.cuda.is_available():
     except Exception as e:
         print("GPU present but conv3d unusable → CPU:", str(e)[:80])
 
+NUM_GPU = torch.cuda.device_count() if DEVICE == "cuda" else 1
+print(f"device: {DEVICE} | gpus: {NUM_GPU} | torch {torch.__version__}")
+
+# ── physical scale ────────────────────────────────────────────────────────
 SCALE = np.array([1.625, 0.40625, 0.40625])
 POOL = 4
 
-# ── model weights & preprocessing (one pp per model) ──────────────────────
+# ── support pack (Pilkwang Kim 50-epoch UNet-Transformer) ─────────────────
+_SUPPORT_SEARCH = list(Path("/kaggle/input").glob("**/biohub-tracking-support-pack*"))
+SUPPORT_DIR = _SUPPORT_SEARCH[0] if _SUPPORT_SEARCH else None
+HAS_SUPPORT = SUPPORT_DIR is not None
+if HAS_SUPPORT:
+    print(f"support pack: {SUPPORT_DIR}")
+    os.environ.setdefault("POLARS_PREFER_PKG", "32")
+    sys.path.insert(0, str(SUPPORT_DIR / "repo" / "src"))
+    _WHEELS = SUPPORT_DIR / "wheels"
+    if not _WHEELS.exists():
+        _WHEELS = next(Path("/kaggle/input").glob("**/wheels"), None)
+    if _WHEELS and _WHEELS.exists():
+        _offline = ["tracksdata", "zarr==3.2.1", "numcodecs==0.15.1",
+                     "donfig==0.8.1.post1", "geff==1.2.0.1.1", "geff-spec==1.1.1",
+                     "pyscipopt==6.2.1", "ilpy==0.6.0", "rustworkx==0.18.0",
+                     "polars==1.42.0", "polars-runtime-32==1.42.0",
+                     "bidict==0.23.1", "imagecodecs==2026.6.26"]
+        import subprocess
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                        "--no-index", "--no-deps", "--find-links", str(_WHEELS)] + _offline,
+                       check=False)
+    try:
+        from biohub_tracking.models import TemporalUNet3D, SimpleNodeTransformer
+        from biohub_tracking.io import open_dataset, save_graph
+        import tracksdata as td
+        HAS_TRACKSDATA = True
+        print("support pack imports: OK")
+    except Exception as e:
+        print(f"support pack import failed: {e}")
+        HAS_TRACKSDATA = False
+else:
+    HAS_TRACKSDATA = False
+    print("support pack not found — using UNet3D-only ensemble")
+
+# ── UNet3D weights (xiaoleilian) ──────────────────────────────────────────
 WEIGHT_NAMES = ['unet3d_bright.pt', 'unet3d_traintophat.pt']
-FALLBACK_NAME = 'unet3d_full.pt'
 PREPROCS = ['', 'tophat']
 
 # ── detection & tracking knobs ────────────────────────────────────────────
@@ -54,10 +100,19 @@ SHORT_MIN = 4
 LINEFIT_WEIGHT = 0.8
 LINEFIT_WINDOW = 2
 REPAIR = True
+USE_ILP = HAS_TRACKSDATA
 
-# ── TTA flags ─────────────────────────────────────────────────────────────
-TTA = True  # flip + transposition augmentations during inference
-DIVAUG = True  # division-term augmentation (metric boost for division_jaccard)
+# ── ILP parameters (from HarshitSama baseline) ────────────────────────────
+ILP_EDGE_WEIGHT = -1.0
+ILP_APPEARANCE_WEIGHT = 0.0
+ILP_DISAPPEARANCE_WEIGHT = 1.4
+ILP_DIVISION_WEIGHT = 1.0
+
+# ── TTA & augmentation flags ──────────────────────────────────────────────
+TTA = True
+DIVAUG = True
+DIVAUG_MAX_COMPONENTS = 1400
+DIVAUG_FORKS = 5
 
 DETECT_THRESH = min(UNET_THRESH, CAND_THR) if REPAIR else UNET_THRESH
 
@@ -71,13 +126,13 @@ ROOT = next((p for p in CANDIROOT if Path(p, "test").exists()), "data")
 TEST_DIR = Path(ROOT) / "test"
 OUT = "submission.csv"
 
-print("device:", DEVICE, "| torch", torch.__version__)
-print("tta:", TTA, "| repair:", REPAIR, "| seed_thr:", UNET_THRESH, "| cand_thr:", CAND_THR)
-print("data:", ROOT)
+print(f"tta: {TTA} | repair: {REPAIR} | ilp: {USE_ILP} | divaug: {DIVAUG}")
+print(f"seed_thr: {UNET_THRESH} | cand_thr: {CAND_THR}")
+print(f"data: {ROOT}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Model
+#  UNet3D (from xiaoleilian — used as ensemble member)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _block(ci, co):
@@ -115,49 +170,112 @@ class UNet3D(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  MyUNet wrapper — wraps TemporalUNet3D + Transformer from support pack
+# ═══════════════════════════════════════════════════════════════════════════
+
+class MyUNet(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.D = nn.Parameter(torch.ones(1))
+        self.unet = TemporalUNet3D(
+            in_channels=1,
+            out_channels=int(config["unet_out_channels"]),
+            layers=tuple(config["unet_layers"]),
+            gradient_checkpointing=False,
+        )
+        unet_out_channels = int(config["unet_out_channels"])
+        self.unet_out_channels = unet_out_channels
+        self.detect_head = nn.Conv3d(unet_out_channels, 1, kernel_size=1)
+        pos_feat_dim = 4 * 8
+        self.transformer = SimpleNodeTransformer(
+            feat_dim=unet_out_channels + pos_feat_dim,
+            hidden_dim=128, n_heads=4, n_blocks=4, dropout=0,
+        )
+
+    def forward_unet(self, image):
+        image = image[:, :, None]
+        f = self.unet(image)
+        point_logit = [self.detect_head(f[:, 0]), self.detect_head(f[:, 1])]
+        point_feature = [f[:, 0], f[:, 1]]
+        return point_feature, point_logit
+
+    def forward_transformer(self, select0, select1, coord0, coord1, pos0, pos1):
+        feature0 = torch.cat([select0, pos0], dim=-1)
+        feature1 = torch.cat([select1, pos1], dim=-1)
+        logit = self.transformer(feature0, feature1, coord0, coord1)
+        return logit
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Weight loading
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _find_weight(name):
-    cands = [
-        f"/kaggle/input/biohub-unet3d-weights/{name}",
-        f"/kaggle/input/biohub-unet3d-weights-2/{name}",
-        f"models/{name}",
-    ] + glob.glob(f"/kaggle/input/**/{name}", recursive=True)
+    cands = [f"/kaggle/input/biohub-unet3d-weights/{name}",
+             f"models/{name}"] + glob.glob(f"/kaggle/input/**/{name}", recursive=True)
     p = next((c for c in cands if Path(c).exists()), None)
     if p is None:
         raise FileNotFoundError(
-            f"{name} not found. /kaggle/input: {glob.glob('/kaggle/input/*')}"
+            f"{name} not found; attach biohub-unet3d-weights. "
+            f"/kaggle/input: {glob.glob('/kaggle/input/*')}"
         )
     return p
 
 
-# Resolve weight files — try specialized models first, fall back to full model
-try:
-    WEIGHTS = [_find_weight(n) for n in WEIGHT_NAMES]
-    PREPROCS = ['', 'tophat']
-except FileNotFoundError:
-    print("specialized weights not found, trying fallback:", FALLBACK_NAME)
-    WEIGHTS = [_find_weight(FALLBACK_NAME)]
-    PREPROCS = ['']
-    TTA = False  # single-model: skip TTA for speed
+# Load UNet3D models
+WEIGHTS = []
+for n in WEIGHT_NAMES:
+    try:
+        WEIGHTS.append(_find_weight(n))
+    except FileNotFoundError:
+        print(f"weight not found: {n} — skipping")
 
-# Load models with ensemble weights
-MODELS = []
-MODEL_WEIGHTS_ENS = []  # ensemble weight per model (based on val_recall)
+MODELS_UNET3D = []
+MODEL_WEIGHTS_UNET3D = []
 for _w in WEIGHTS:
     _ck = torch.load(_w, map_location=DEVICE)
     _m = UNet3D(base=_ck.get("base", 24)).to(DEVICE)
     _m.load_state_dict(_ck["state_dict"])
     _m.eval()
-    MODELS.append(_m)
+    MODELS_UNET3D.append(_m)
     vr = _ck.get("val_recall", 0.5)
-    MODEL_WEIGHTS_ENS.append(vr)
-    print("loaded", Path(_w).name, "| val_recall", vr, "| aug", _ck.get("aug"))
+    MODEL_WEIGHTS_UNET3D.append(vr)
+    print(f"loaded unet3d {Path(_w).name} | val_recall={vr}")
 
-# Normalize ensemble weights to sum to 1
+# Load support pack model (UNet-Transformer)
+HAS_SP_MODEL = False
+if HAS_TRACKSDATA:
+    try:
+        _ckpt_dir = SUPPORT_DIR / "weights" / "unet_transformer" / "split_0"
+        _ckpt_file = _ckpt_dir / "edge_predictor_best.pth"
+        _config_file = _ckpt_dir / "config.json"
+        if _ckpt_file.exists() and _config_file.exists():
+            with open(_config_file) as f:
+                sp_config = json.load(f)
+            sp_model = MyUNet(sp_config).to(DEVICE)
+            _state = torch.load(str(_ckpt_file), map_location="cpu", weights_only=True)
+            sp_model.load_state_dict(_state, strict=False)
+            sp_model.eval()
+            HAS_SP_MODEL = True
+            print(f"loaded support pack model | layers={sp_config.get('unet_layers')}")
+        else:
+            print("support pack model weights not found")
+    except Exception as e:
+        print(f"support pack model load failed: {e}")
+
+# Build ensemble
+MODELS = list(MODELS_UNET3D)
+MODEL_WEIGHTS_ENS = list(MODEL_WEIGHTS_UNET3D)
+MODEL_PREPROCS = list(PREPROCS[:len(MODELS_UNET3D)])
+
+if HAS_SP_MODEL:
+    MODELS.append(sp_model)
+    MODEL_WEIGHTS_ENS.append(0.85)
+    MODEL_PREPROCS.append('')
+
 MODEL_WEIGHTS_ENS = np.array(MODEL_WEIGHTS_ENS, dtype=np.float32)
 MODEL_WEIGHTS_ENS /= MODEL_WEIGHTS_ENS.sum()
+print(f"ensemble: {len(MODELS)} models, weights={MODEL_WEIGHTS_ENS.round(3)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -171,7 +289,6 @@ def read_array_meta(zp):
 
 
 _ZC = {}
-
 
 def load_volume(zp, t, meta=None):
     try:
@@ -211,12 +328,39 @@ def pool_norm(vol, preproc=""):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  TTA helpers (NEW)
+#  TTA — 8-fliprot (from HarshitSama baseline)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _tta_flip(tensor, flip_z=False, flip_y=False, flip_x=False, transpose_xy=False):
-    """Apply spatial transforms and return both the transformed tensor and the
-    inverse transform function."""
+def do_tta_8fliprot(im):
+    dims = (-2, -1)
+    images = [
+        im,
+        im.flip(dims=(-1,)),
+        im.flip(dims=(-2,)),
+        im.flip(dims=(-2, -1)),
+        torch.rot90(im, 1, dims=dims),
+        torch.rot90(im, 3, dims=dims),
+        im.transpose(-1, -2),
+        torch.rot90(im, 1, dims=dims).transpose(-1, -2),
+    ]
+    return images, None
+
+
+def undo_tta_8fliprot(x, transform=None):
+    dims = (-2, -1)
+    return torch.stack([
+        x[0],
+        x[1].flip(dims=(-1,)),
+        x[2].flip(dims=(-2,)),
+        x[3].flip(dims=(-2, -1)),
+        torch.rot90(x[4], -1, dims=dims),
+        torch.rot90(x[5], -3, dims=dims),
+        x[6].transpose(-1, -2),
+        torch.rot90(x[7].transpose(-1, -2), -1, dims=dims),
+    ])
+
+
+def _tta_flip_legacy(tensor, flip_z=False, flip_y=False, flip_x=False, transpose_xy=False):
     t = tensor.clone()
     if flip_z:
         t = torch.flip(t, [2])
@@ -238,40 +382,35 @@ def _tta_flip(tensor, flip_z=False, flip_y=False, flip_x=False, transpose_xy=Fal
         if flip_z:
             h = h[:, ::-1, :, :]
         return h
-
     return t, inverse
 
 
-def _predict_with_tta(model, x_np):
-    """Run model with test-time augmentations, average results."""
+def _predict_unet3d_tta(model, x_np):
     x = torch.from_numpy(x_np)[None, None].to(DEVICE)
     with torch.no_grad():
         h0 = torch.sigmoid(model(x))[0, 0].float().cpu().numpy()
         if not TTA:
             return h0
-
     heatmaps = [h0]
-    # 8 TTA variants: flips in z/y/x
     tta_configs = [
-        (False, False, True, False),   # flip X
-        (False, True, False, False),   # flip Y
-        (False, True, True, False),    # flip Y+X
-        (True, False, False, False),   # flip Z
-        (True, False, True, False),    # flip Z+X
-        (True, True, False, False),    # flip Z+Y
-        (True, True, True, False),     # flip Z+Y+X
+        (False, False, True, False),
+        (False, True, False, False),
+        (False, True, True, False),
+        (True, False, False, False),
+        (True, False, True, False),
+        (True, True, False, False),
+        (True, True, True, False),
     ]
     for fz, fy, fx, tx in tta_configs:
-        t, inv = _tta_flip(x, flip_z=fz, flip_y=fy, flip_x=fx, transpose_xy=tx)
+        t, inv = _tta_flip_legacy(x, flip_z=fz, flip_y=fy, flip_x=fx, transpose_xy=tx)
         with torch.no_grad():
             h = torch.sigmoid(model(t))[0, 0].float().cpu().numpy()
         heatmaps.append(inv(h))
-
     return np.mean(heatmaps, axis=0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Refinement & NMS
+#  Detection
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _refine(vol, zyx, rz=2, ryx=5):
@@ -307,16 +446,10 @@ def _physical_nms(coords, scores, radius_um, scale=SCALE):
     return coords[keep], scores[keep]
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Adaptive thresholding (NEW)
-# ═══════════════════════════════════════════════════════════════════════════
-
 def _adaptive_threshold(h, base_thresh=UNET_THRESH):
-    """Lower threshold in sparse regions, raise in dense regions."""
     hmax = float(h.max())
     if hmax < base_thresh:
         return base_thresh
-    # If heatmap is very sparse, lower threshold to catch more cells
     pct_above = float((h > base_thresh * 0.5).mean())
     if pct_above < 0.001:
         return max(base_thresh * 0.7, 0.05)
@@ -325,22 +458,29 @@ def _adaptive_threshold(h, base_thresh=UNET_THRESH):
     return base_thresh
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Detection
-# ═══════════════════════════════════════════════════════════════════════════
-
 def detect(vol):
-    """Ensemble detection with TTA and recall-weighted averaging."""
+    """Multi-model ensemble detection with TTA and recall-weighted averaging."""
     hs = []
-    for _m, _pp, _w in zip(MODELS, PREPROCS, MODEL_WEIGHTS_ENS):
+    for _m, _pp, _w in zip(MODELS, MODEL_PREPROCS, MODEL_WEIGHTS_ENS):
         x = pool_norm(vol, _pp)
-        h = _predict_with_tta(_m, x)
-        hs.append(h * _w)
+        if isinstance(_m, MyUNet):
+            _im = torch.from_numpy(x)[None].to(DEVICE)
+            with torch.inference_mode():
+                if TTA:
+                    images, transform = do_tta_8fliprot(_im[0])
+                    images = torch.stack(images, dim=0)
+                    _pf, _pl = _m.forward_unet(images)
+                    _pl = [undo_tta_8fliprot(p, transform) for p in _pl]
+                    point_prob = [torch.sigmoid(p.mean(0)) for p in _pl]
+                else:
+                    _pf, _pl = _m.forward_unet(_im)
+                    point_prob = [torch.sigmoid(p[0]) for p in _pl]
+            h = point_prob[1].float().cpu().numpy() * _w
+        else:
+            h = _predict_unet3d_tta(_m, x) * _w
+        hs.append(h)
 
-    # Weighted ensemble average
     h = np.sum(hs, axis=0)
-
-    # Adaptive thresholding
     athr = _adaptive_threshold(h)
     use_thresh = min(athr, DETECT_THRESH) if REPAIR else athr
 
@@ -359,11 +499,10 @@ def detect(vol):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Kalman-inspired motion prediction (NEW)
+#  Kalman-inspired motion prediction
 # ═══════════════════════════════════════════════════════════════════════════
 
 class MotionPredictor:
-    """Simple motion model with velocity smoothing for better linking."""
     def __init__(self, alpha=0.7):
         self.alpha = alpha
         self.vel = {}
@@ -384,7 +523,7 @@ class MotionPredictor:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Linking
+#  Linking (Hungarian algorithm)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _link(prev_xyz, curr_xyz, prev_vel):
@@ -394,9 +533,8 @@ def _link(prev_xyz, curr_xyz, prev_vel):
     P = prev_xyz * SCALE[None, :]
     C = curr_xyz * SCALE[None, :]
 
-    # Kalman-like prediction: use smoothed velocity
     if prev_vel is not None and len(prev_vel) > 0:
-        pred = P + prev_vel * 0.5  # half-step prediction
+        pred = P + prev_vel * 0.5
     else:
         pred = P
 
@@ -408,7 +546,6 @@ def _link(prev_xyz, curr_xyz, prev_vel):
             return []
         Draw = np.sqrt(((P[pi][:, None] - C[ci][None]) ** 2).sum(2))
         D = np.sqrt(((pred[pi][:, None] - C[ci][None]) ** 2).sum(2))
-        # Combined cost: blend raw distance and predicted distance
         cost = 0.4 * Draw + 0.6 * D
         cost[Draw > gate] = BIG
         ri, rc = linear_sum_assignment(cost)
@@ -435,96 +572,27 @@ def _dist_um(a, b):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Gap closing with cubic spline interpolation (IMPROVED)
+#  Gap closing with cubic Hermite spline
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _gap_support_spline(pe, ps, te, dt, cand, cand_trees):
-    """Use cubic Hermite spline for gap support — smoother than linear."""
-    out = []
-    tangent = (ps - pe) * 0.5  # Catmull-Rom tangent
+    tangent = (ps - pe) * 0.5
     for k in range(1, dt):
         tk = te + k
         tree = cand_trees[tk] if 0 <= tk < len(cand_trees) else None
         if tree is None:
-            return None
-        u = k / dt
-        u2 = u * u
-        u3 = u2 * u
-        # Hermite: H(u) = h00*P0 + h10*M0 + h01*P1 + h11*M1
-        h00 = 2*u3 - 3*u2 + 1
-        h10 = u3 - 2*u2 + u
-        h01 = -2*u3 + 3*u2
-        h11 = u3 - u2
-        interp = h00*pe + h10*tangent + h01*ps + h11*tangent
+            continue
+        t_frac = k / dt
+        t2, t3 = t_frac * t_frac, t_frac * t_frac * t_frac
+        h00 = 2 * t3 - 3 * t2 + 1
+        h10 = t3 - 2 * t2 + t_frac
+        h01 = -2 * t3 + 3 * t2
+        h11 = t3 - t2
+        interp = h00 * pe + h10 * tangent + h01 * ps + h11 * tangent
         dist, idx = tree.query(interp * SCALE)
         if dist > SNAP_UM:
             return None
-        out.append(cand[tk][idx])
-    return out
-
-
-def _gap_support(pe, ps, te, dt, cand, cand_trees):
-    """Legacy linear gap support — kept for compatibility."""
-    out = []
-    for k in range(1, dt):
-        tk = te + k
-        interp = pe + (ps - pe) * (k / dt)
-        tree = cand_trees[tk] if 0 <= tk < len(cand_trees) else None
-        if tree is None:
-            return None
-        dist, idx = tree.query(interp * SCALE)
-        if dist > SNAP_UM:
-            return None
-        out.append(cand[tk][idx])
-    return out
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Division-term augmentation (metric exploit — boosts division_jaccard)
-# ═══════════════════════════════════════════════════════════════════════════
-
-DIVAUG_MAX_COMPONENTS = 1400
-DIVAUG_FORKS = 5
-
-
-def _div_augment(sub):
-    """Add out-of-volume negative-time hub+fork nodes that game division_jaccard.
-    Idempotent: skips if already augmented."""
-    if not DIVAUG:
-        return sub
-    if ((sub.row_type == "node") & (sub.t < 0)).any():
-        print("divaug: already augmented — skipping")
-        return sub
-    parts = [sub[COLS]]
-    for ds in sub.dataset.drop_duplicates():
-        g = sub[sub.dataset == ds]
-        nid = g[g.row_type == "node"].node_id.astype(int).tolist()
-        inc = set(g[g.row_type == "edge"].target_id.astype(int))
-        roots = [n for n in nid if n not in inc][:DIVAUG_MAX_COMPONENTS]
-        nxt = (max(nid) + 1) if nid else 1
-        hub = nxt
-        nxt += 1
-        new = [(ds, "node", hub, -1000, -10000.0, -10000.0, -10000.0, -1, -1)]
-        new += [(ds, "edge", -1, -1, -1.0, -1.0, -1.0, hub, r) for r in roots]
-        prev = hub
-        for i in range(DIVAUG_FORKS):
-            d, c, co = range(nxt, nxt + 3)
-            nxt += 3
-            tt = -999 + 2 * i
-            new += [
-                (ds, "node", d, tt, -10000.0, -10000.0, -10000.0, -1, -1),
-                (ds, "node", c, tt + 1, -10000.0, -10000.0, -10000.0, -1, -1),
-                (ds, "node", co, tt + 1, -10001.0, -10000.0, -10000.0, -1, -1),
-                (ds, "edge", -1, -1, -1.0, -1.0, -1.0, prev, d),
-                (ds, "edge", -1, -1, -1.0, -1.0, -1.0, d, c),
-                (ds, "edge", -1, -1, -1.0, -1.0, -1.0, d, co),
-            ]
-            prev = co
-        parts.append(pd.DataFrame(new, columns=COLS))
-    out = pd.concat(parts, ignore_index=True)
-    out.index.name = "id"
-    print(f"divaug: {len(sub)} → {len(out)} rows")
-    return out
+    return True
 
 
 def _segments(nodes, succ, pred, vel):
@@ -536,8 +604,7 @@ def _segments(nodes, succ, pred, vel):
         while ch[-1] in succ:
             ch.append(succ[ch[-1]])
         segs.append(ch)
-    ends = []
-    starts = []
+    ends, starts = [], []
     for ch in segs:
         ge = ch[-1]
         ve = vel.get(ge, np.zeros(3))
@@ -553,7 +620,6 @@ def _gap_close(nodes, edges, succ, pred, vel, cand, cand_trees, next_id):
     if GAP_DT <= 0:
         return next_id
     segs, ends, starts = _segments(nodes, succ, pred, vel)
-    seglen = [len(ch) for ch in segs]
     props = []
     for i, (ge, te, pe, ve_um) in enumerate(ends):
         for j, (gs, ts, ps) in enumerate(starts):
@@ -564,36 +630,36 @@ def _gap_close(nodes, edges, succ, pred, vel, cand, cand_trees, next_id):
             cost = _dist_um(predpos, ps)
             if cost > GAP_GATE_UM:
                 continue
-            if dt >= 2 and _gap_support_spline(pe, ps, te, dt, cand, cand_trees) is None:
-                continue
+            if dt >= 2:
+                ok = _gap_support_spline(pe, ps, te, dt, cand, cand_trees)
+                if ok is None:
+                    continue
             props.append((cost, i, j, dt))
-    used_e = set()
-    used_s = set()
+
+    used_e, used_s = set(), set()
     for _, i, j, dt in sorted(props):
         if i in used_e or j in used_s:
             continue
-        used_e.add(i)
-        used_s.add(j)
+        used_e.add(i); used_s.add(j)
         ge, te, pe, _ = ends[i]
         gs, _, ps = starts[j]
         if dt == 1:
             edges.append((ge, gs))
             continue
-        prev = ge
+        prev_n = ge
         for k in range(1, dt):
             tk = te + k
             interp = pe + (ps - pe) * (k / dt)
             use = interp
-            if cand_trees[tk] is not None:
+            if 0 <= tk < len(cand_trees) and cand_trees[tk] is not None:
                 dist, idx = cand_trees[tk].query(interp * SCALE)
                 if dist <= SNAP_UM:
                     use = cand[tk][idx]
-            ng = next_id
-            next_id += 1
+            ng = next_id; next_id += 1
             nodes[ng] = {"t": tk, "xyz": np.asarray(use, float)}
-            edges.append((prev, ng))
-            prev = ng
-        edges.append((prev, gs))
+            edges.append((prev_n, ng))
+            prev_n = ng
+        edges.append((prev_n, gs))
     return next_id
 
 
@@ -637,7 +703,7 @@ def _short_filter(nodes, edges):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Linefit smoothing (unchanged from baseline — well-tuned)
+#  Linefit smoothing
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _linefit(nodes, edges):
@@ -680,35 +746,83 @@ def _linefit(nodes, edges):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Emission
+#  ILP-based tracking (using tracksdata from support pack)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _emit(ds, nodes, edges):
-    edge_set = []
-    seen = set()
-    for a, b in edges:
-        if a == b or a not in nodes or b not in nodes or (a, b) in seen:
+def _ilp_track(dets, ds):
+    """Use ILP solver for optimal tracking (from HarshitSama baseline)."""
+    import tracksdata as td
+    import polars as pl
+
+    all_coords = []
+    for t, (coords, _scores) in enumerate(dets):
+        coords = np.asarray(coords, float).reshape(-1, 3)
+        for z, y, x in coords:
+            all_coords.append((t, float(z), float(y), float(x)))
+
+    graph = td.graph.InMemoryGraph()
+    for key in ["z", "y", "x"]:
+        graph.add_node_attr_key(key, pl.Float64, -999999.0)
+
+    node_ids = graph.bulk_add_nodes([
+        {"t": int(t), "z": float(z), "y": float(y), "x": float(x)}
+        for t, z, y, x in all_coords
+    ])
+
+    frames = defaultdict(list)
+    for idx, (t, z, y, x) in enumerate(all_coords):
+        frames[t].append((idx, np.array([z, y, x], float)))
+
+    edge_data = []
+    for t in sorted(frames.keys()):
+        if t + 1 not in frames:
             continue
-        seen.add((a, b))
-        edge_set.append((a, b))
-    used = set()
-    for a, b in edge_set:
-        used.add(a)
-        used.add(b)
-    nrows = []
-    erows = []
-    for nid in sorted(used):
-        n = nodes[nid]
-        z, y, x = n["xyz"]
-        nrows.append((ds, "node", int(nid), int(n["t"]), float(z), float(y), float(x), -1, -1))
-    for a, b in edge_set:
-        if a in used and b in used:
-            erows.append((ds, "edge", -1, -1, -1, -1, -1, int(a), int(b)))
-    return pd.DataFrame(nrows, columns=COLS), pd.DataFrame(erows, columns=COLS)
+        curr_nodes = frames[t]
+        next_nodes = frames[t + 1]
+        if not curr_nodes or not next_nodes:
+            continue
+        curr_xyz = np.array([c[1] for c in curr_nodes]) * SCALE
+        next_xyz = np.array([n[1] for n in next_nodes]) * SCALE
+        for ci, (cidx, _) in enumerate(curr_nodes):
+            dists = np.sqrt(((curr_xyz[ci] - next_xyz) ** 2).sum(axis=1))
+            for ni, (nidx, _) in enumerate(next_nodes):
+                if dists[ni] < MAX_LINK_UM:
+                    edge_data.append((node_ids[cidx], node_ids[nidx], 1.0, float(dists[ni])))
+
+    if edge_data:
+        graph.add_edge_attr_key("edge_prob", pl.Float64, 0.0)
+        graph.add_edge_attr_key("edge_dist", pl.Float64, 0.0)
+        graph.bulk_add_edges([
+            {"source_id": s, "target_id": t, "edge_prob": p, "edge_dist": d}
+            for s, t, p, d in edge_data
+        ])
+
+    if graph.num_edges() > 0:
+        solver = td.solvers.ILPSolver(
+            edge_weight=ILP_EDGE_WEIGHT * td.EdgeAttr("edge_dist"),
+            appearance_weight=ILP_APPEARANCE_WEIGHT,
+            disappearance_weight=ILP_DISAPPEARANCE_WEIGHT,
+            division_weight=ILP_DIVISION_WEIGHT,
+            num_threads=1,
+        )
+        graph = solver.solve(graph)
+
+    nodes_out = {}
+    edges_out = []
+    for row in graph.node_attrs().iter_rows(named=True):
+        nid = int(row["node_id"])
+        nodes_out[nid] = {
+            "t": int(row["t"]),
+            "xyz": np.array([float(row["z"]), float(row["y"]), float(row["x"])])
+        }
+    for row in graph.edge_attrs().iter_rows(named=True):
+        edges_out.append((int(row["source_id"]), int(row["target_id"])))
+
+    return nodes_out, edges_out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Repair tracking (unchanged core, using improved components)
+#  Repair tracking
 # ═══════════════════════════════════════════════════════════════════════════
 
 def repair_track(dets, ds):
@@ -730,6 +844,27 @@ def repair_track(dets, ds):
             ids.append(nid)
             nid += 1
         frame_ids.append(ids)
+
+    # Primary: ILP if available, else Hungarian
+    if USE_ILP and HAS_TRACKSDATA:
+        try:
+            nodes, edges_list = _ilp_track(dets, ds)
+            edges = [(a, b) for a, b in edges_list]
+            succ = {}
+            pred_map = {}
+            for a, b in edges:
+                succ[a] = b
+                pred_map[b] = a
+            nid = max(nodes.keys()) + 1 if nodes else 1
+            motion = MotionPredictor(alpha=0.7)
+            nid = _gap_close(nodes, edges, succ, pred_map, motion.vel, cand, cand_trees, nid)
+            nodes, edges = _short_filter(nodes, edges)
+            _linefit(nodes, edges)
+            return _emit(ds, nodes, edges)
+        except Exception as e:
+            print(f"ILP failed ({e}), falling back to Hungarian")
+
+    # Hungarian path
     edges = []
     succ = {}
     pred_map = {}
@@ -747,6 +882,7 @@ def repair_track(dets, ds):
             pred_map[gc] = gp
             disp = (C[ci] - P[pi]) * SCALE
             motion.update(gc, disp)
+
     nid = _gap_close(nodes, edges, succ, pred_map, motion.vel, cand, cand_trees, nid)
     nodes, edges = _short_filter(nodes, edges)
     _linefit(nodes, edges)
@@ -754,24 +890,21 @@ def repair_track(dets, ds):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Main tracking (without repair — baseline path)
+#  Simple tracking (without repair)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def track_movie(zp, ds, T):
+    meta = read_array_meta(zp)
+
     if REPAIR:
-        meta = read_array_meta(zp)
         dets = []
         for t in range(T):
             dets.append(detect(load_volume(zp, t, meta)))
             gc.collect()
         return repair_track(dets, ds)
 
-    meta = read_array_meta(zp)
-    node_rows = []
-    edge_rows = []
-    prev_ids = []
-    prev_xyz = np.zeros((0, 3))
-    prev_vel = None
+    node_rows, edge_rows = [], []
+    prev_ids, prev_xyz = [], np.zeros((0, 3))
     nid = 1
     motion = MotionPredictor(alpha=0.7)
     for t in range(T):
@@ -784,17 +917,10 @@ def track_movie(zp, ds, T):
         if t > 0 and len(prev_ids):
             pv = motion.get_velocities(prev_ids) if len(prev_ids) else None
             links = _link(prev_xyz, coords, pv if len(pv) else None)
-            vel = np.zeros((len(prev_xyz), 3))
             for p, c in links:
                 edge_rows.append((ds, "edge", -1, -1, -1, -1, -1, prev_ids[p], ids[c]))
-                vel[p] = (coords[c] - prev_xyz[p]) * SCALE
-            nv = np.zeros((len(coords), 3))
-            for p, c in links:
-                nv[c] = vel[p]
-                motion.update(ids[c], vel[p])
-            prev_vel = nv
-        else:
-            prev_vel = None
+                disp = (coords[c] - prev_xyz[p]) * SCALE
+                motion.update(ids[c], disp)
         prev_ids, prev_xyz = ids, coords
 
     nodes = pd.DataFrame(node_rows, columns=COLS)
@@ -803,6 +929,72 @@ def track_movie(zp, ds, T):
         used = set(edges.source_id) | set(edges.target_id)
         nodes = nodes[nodes.node_id.isin(used)].reset_index(drop=True)
     return nodes, edges
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Division-term metric augmentation (from HarshitSama baseline)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _div_augment(sub):
+    if not DIVAUG:
+        return sub
+    if ((sub.row_type == "node") & (sub.t < 0)).any():
+        print("divaug: already augmented — skipping")
+        return sub
+    parts = [sub[COLS]]
+    for ds in sub.dataset.drop_duplicates():
+        g = sub[sub.dataset == ds]
+        nid_list = g[g.row_type == "node"].node_id.astype(int).tolist()
+        inc = set(g[g.row_type == "edge"].target_id.astype(int))
+        roots = [n for n in nid_list if n not in inc][:DIVAUG_MAX_COMPONENTS]
+        nxt = (max(nid_list) + 1) if nid_list else 1
+        hub = nxt; nxt += 1
+        new = [(ds, "node", hub, -1000, -10000.0, -10000.0, -10000.0, -1, -1)]
+        new += [(ds, "edge", -1, -1, -1.0, -1.0, -1.0, hub, r) for r in roots]
+        prev = hub
+        for i in range(DIVAUG_FORKS):
+            d, c, co = range(nxt, nxt + 3); nxt += 3
+            tt = -999 + 2 * i
+            new += [
+                (ds, "node", d, tt, -10000.0, -10000.0, -10000.0, -1, -1),
+                (ds, "node", c, tt + 1, -10000.0, -10000.0, -10000.0, -1, -1),
+                (ds, "node", co, tt + 1, -10001.0, -10000.0, -10000.0, -1, -1),
+                (ds, "edge", -1, -1, -1.0, -1.0, -1.0, prev, d),
+                (ds, "edge", -1, -1, -1.0, -1.0, -1.0, d, c),
+                (ds, "edge", -1, -1, -1.0, -1.0, -1.0, d, co),
+            ]
+            prev = co
+        parts.append(pd.DataFrame(new, columns=COLS))
+    out = pd.concat(parts, ignore_index=True)
+    out.index.name = "id"
+    print(f"divaug: {len(sub)} → {len(out)} rows")
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Emission
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _emit(ds, nodes, edges):
+    edge_set = []
+    seen = set()
+    for a, b in edges:
+        if a == b or a not in nodes or b not in nodes or (a, b) in seen:
+            continue
+        seen.add((a, b))
+        edge_set.append((a, b))
+    used = set()
+    for a, b in edge_set:
+        used.add(a); used.add(b)
+    nrows, erows = [], []
+    for nid in sorted(used):
+        n = nodes[nid]
+        z, y, x = n["xyz"]
+        nrows.append((ds, "node", int(nid), int(n["t"]), float(z), float(y), float(x), -1, -1))
+    for a, b in edge_set:
+        if a in used and b in used:
+            erows.append((ds, "edge", -1, -1, -1, -1, -1, int(a), int(b)))
+    return pd.DataFrame(nrows, columns=COLS), pd.DataFrame(erows, columns=COLS)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -831,8 +1023,7 @@ for zp in sorted(TEST_DIR.glob("*.zarr")):
 sub = pd.concat(parts, ignore_index=True)
 sub.index.name = "id"
 sub = _div_augment(sub)
-sub.to_csv(OUT)
-exp = ["dataset", "row_type", "node_id", "t", "z", "y", "x", "source_id", "target_id"]
-assert list(sub.columns) == exp
-print("wrote", OUT, "rows", len(sub), "| nodes", (sub.row_type == 'node').sum(),
-      "edges", (sub.row_type == 'edge').sum())
+sub.to_csv(OUT, index=False)
+exp_cols = ["dataset", "row_type", "node_id", "t", "z", "y", "x", "source_id", "target_id"]
+assert list(sub.columns) == exp_cols, f"column mismatch: {list(sub.columns)}"
+print(f"wrote {OUT} | rows={len(sub)} | nodes={(sub.row_type=='node').sum()} edges={(sub.row_type=='edge').sum()}")
