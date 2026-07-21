@@ -193,7 +193,7 @@ class MyUNet(nn.Module):
         )
 
     def forward_unet(self, image):
-        image = image[:, :, None]
+        image = image[:, None]  # [B, Z, H, W] → [B, 1, Z, H, W]
         f = self.unet(image)
         point_logit = [self.detect_head(f[:, 0]), self.detect_head(f[:, 1])]
         point_feature = [f[:, 0], f[:, 1]]
@@ -229,6 +229,17 @@ for n in WEIGHT_NAMES:
         WEIGHTS.append(_find_weight(n))
     except FileNotFoundError:
         print(f"weight not found: {n} — skipping")
+
+# Fall back to full model if no specialized weights found
+FALLBACK_NAME = 'unet3d_full.pt'
+FALLBACK_PREPROC = ['']
+if not WEIGHTS and not HAS_SP_MODEL:
+    try:
+        WEIGHTS.append(_find_weight(FALLBACK_NAME))
+        FALLBACK_PREPROC = ['']
+        print(f"using fallback: {FALLBACK_NAME}")
+    except FileNotFoundError:
+        print(f"fallback {FALLBACK_NAME} not found")
 
 MODELS_UNET3D = []
 MODEL_WEIGHTS_UNET3D = []

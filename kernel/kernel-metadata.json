@@ -1,14 +1,1 @@
-{
-  "id": "chrisyu2021/biohub-ct-improved",
-  "title": "biohub-ct-improved",
-  "code_file": "main.py",
-  "language": "python",
-  "kernel_type": "script",
-  "is_private": true,
-  "enable_gpu": true,
-  "enable_internet": false,
-  "competition_sources": ["biohub-cell-tracking-during-development"],
-  "dataset_sources": [
-    "pilkwang/biohub-tracking-support-pack-50ep-v1"
-  ]
-}
+{"id":"chrisyu2021/biohub-ct-xiaolei","title":"biohub-ct-xiaolei","code_file":"main.py","language":"python","kernel_type":"script","is_private":true,"enable_gpu":true,"enable_internet":false,"competition_sources":["biohub-cell-tracking-during-development"],"dataset_sources":["chrisyu2021/biohub-unet3d-weights"]}
