@@ -1,6 +1,6 @@
 {
   "id": "chrisyu2021/biohub-ct-improved",
-  "title": "biohub-ct-improved",
+  "title": "biohub-ct-improved-multi-model-ensemble-ilp",
   "code_file": "main.py",
   "language": "python",
   "kernel_type": "script",
@@ -8,5 +8,8 @@
   "enable_gpu": true,
   "enable_internet": false,
   "competition_sources": ["biohub-cell-tracking-during-development"],
-  "dataset_sources": ["xiaoleilian/biohub-unet3d-weights"]
+  "dataset_sources": [
+    "xiaoleilian/biohub-unet3d-weights",
+    "pilkwang/biohub-tracking-support-pack-50ep-v1"
+  ]
 }
