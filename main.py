@@ -232,11 +232,9 @@ for n in WEIGHT_NAMES:
 
 # Fall back to full model if no specialized weights found
 FALLBACK_NAME = 'unet3d_full.pt'
-FALLBACK_PREPROC = ['']
-if not WEIGHTS and not HAS_SP_MODEL:
+if not WEIGHTS and not HAS_SUPPORT:
     try:
         WEIGHTS.append(_find_weight(FALLBACK_NAME))
-        FALLBACK_PREPROC = ['']
         print(f"using fallback: {FALLBACK_NAME}")
     except FileNotFoundError:
         print(f"fallback {FALLBACK_NAME} not found")
